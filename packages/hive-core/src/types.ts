@@ -72,6 +72,12 @@ export interface TaskStatus {
    * Resolved from plan.md dependency annotations during hive_tasks_sync.
    */
   dependsOn?: string[];
+  /**
+   * Repository paths for multi-repo worktrees.
+   * When specified, Hive creates separate worktrees for each repo instead of the whole monorepo.
+   * Parsed from plan.md "Repos:" annotation during hive_tasks_sync.
+   */
+  repos?: string[];
 }
 
 export interface PlanComment {
@@ -106,6 +112,8 @@ export interface TaskInfo {
   origin: TaskOrigin;
   planTitle?: string;
   summary?: string;
+  /** Repository paths for multi-repo worktrees (e.g., ["libs/sdk", "services/bifrost"]) */
+  repos?: string[];
 }
 
 export interface FeatureInfo {

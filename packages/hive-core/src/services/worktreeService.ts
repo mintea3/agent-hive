@@ -44,6 +44,16 @@ export interface WorktreeConfig {
   hiveDir: string;
 }
 
+/** Multi-repo worktree information for per-repo isolation */
+export interface MultiRepoWorktreeInfo {
+  feature: string;
+  step: string;
+  /** Map of repo name to worktree info */
+  repos: Record<string, WorktreeInfo>;
+  /** Base directory containing all repo worktrees */
+  basePath: string;
+}
+
 export class WorktreeService {
   private config: WorktreeConfig;
 
@@ -65,14 +75,14 @@ export class WorktreeService {
 
   private async getStepStatusPath(feature: string, step: string): Promise<string> {
     const featurePath = path.join(this.config.hiveDir, "features", feature);
-    
+
     // Check v2 structure first (tasks/)
     const tasksPath = path.join(featurePath, "tasks", step, "status.json");
     try {
       await fs.access(tasksPath);
       return tasksPath;
-    } catch {}
-    
+    } catch { }
+
     // Fall back to v1 structure (execution/)
     return path.join(featurePath, "execution", step, "status.json");
   }
@@ -117,6 +127,92 @@ export class WorktreeService {
     };
   }
 
+  /**
+   * Create worktrees in multiple independent repos for a single task.
+   * Each repo gets its own isolated worktree under .hive/.worktrees/<feature>/<step>/<repo-name>/
+   * 
+   * @param feature - Feature name
+   * @param step - Step/task name
+   * @param repos - Array of repo paths relative to baseDir (e.g., ["libs/sdk", "services/bifrost"])
+   * @param baseBranch - Optional base branch/commit to create from
+   */
+  async createMultiRepo(
+    feature: string,
+    step: string,
+    repos: string[],
+    baseBranch?: string
+  ): Promise<MultiRepoWorktreeInfo> {
+    const worktreeBasePath = this.getWorktreePath(feature, step);
+    await fs.mkdir(worktreeBasePath, { recursive: true });
+
+    const result: MultiRepoWorktreeInfo = {
+      feature,
+      step,
+      repos: {},
+      basePath: worktreeBasePath,
+    };
+
+    for (const repoPath of repos) {
+      const repoName = path.basename(repoPath);
+      const repoFullPath = path.join(this.config.baseDir, repoPath);
+      const worktreePath = path.join(worktreeBasePath, repoName);
+      const branchName = this.getBranchName(feature, step);
+
+      // Get git instance for this specific repo
+      const repoGit = simpleGit(repoFullPath);
+
+      // Check if repo exists
+      try {
+        await fs.access(path.join(repoFullPath, ".git"));
+      } catch {
+        throw new Error(`Repository not found at ${repoPath}. Ensure it has its own .git directory.`);
+      }
+
+      // Determine base commit
+      const base = baseBranch || (await repoGit.revparse(["HEAD"])).trim();
+
+      // Check if worktree already exists
+      try {
+        await fs.access(worktreePath);
+        const worktreeGit = this.getGit(worktreePath);
+        const commit = (await worktreeGit.revparse(["HEAD"])).trim();
+        result.repos[repoName] = {
+          path: worktreePath,
+          branch: branchName,
+          commit,
+          feature,
+          step,
+        };
+        continue;
+      } catch {
+        // Worktree doesn't exist, create it
+      }
+
+      try {
+        await repoGit.raw(["worktree", "add", "-b", branchName, worktreePath, base]);
+      } catch {
+        try {
+          await repoGit.raw(["worktree", "add", worktreePath, branchName]);
+        } catch (retryError) {
+          throw new Error(`Failed to create worktree for ${repoPath}: ${retryError}`);
+        }
+      }
+
+      const worktreeGit = this.getGit(worktreePath);
+      const commit = (await worktreeGit.revparse(["HEAD"])).trim();
+
+      result.repos[repoName] = {
+        path: worktreePath,
+        branch: branchName,
+        commit,
+        feature,
+        step,
+      };
+    }
+
+    return result;
+  }
+
   async get(feature: string, step: string): Promise<WorktreeInfo | null> {
     const worktreePath = this.getWorktreePath(feature, step);
     const branchName = this.getBranchName(feature, step);
@@ -140,30 +236,30 @@ export class WorktreeService {
   async getDiff(feature: string, step: string, baseCommit?: string): Promise<DiffResult> {
     const worktreePath = this.getWorktreePath(feature, step);
     const statusPath = await this.getStepStatusPath(feature, step);
-    
+
     let base = baseCommit;
     if (!base) {
       try {
         const status = JSON.parse(await fs.readFile(statusPath, "utf-8"));
         base = status.baseCommit;  // Read baseCommit directly from task status
-      } catch {}
+      } catch { }
     }
-    
+
     if (!base) {
       base = "HEAD~1";
     }
-    
+
     const worktreeGit = this.getGit(worktreePath);
 
     try {
       await worktreeGit.raw(["add", "-A"]);
-      
+
       const status = await worktreeGit.status();
       const hasStaged = status.staged.length > 0;
-      
+
       let diffContent = "";
       let stat = "";
-      
+
       if (hasStaged) {
         diffContent = await worktreeGit.diff(["--cached"]);
         stat = diffContent ? await worktreeGit.diff(["--cached", "--stat"]) : "";
@@ -171,7 +267,7 @@ export class WorktreeService {
         diffContent = await worktreeGit.diff([`${base}..HEAD`]).catch(() => "");
         stat = diffContent ? await worktreeGit.diff([`${base}..HEAD`, "--stat"]) : "";
       }
-      
+
       const statLines = stat.split("\n").filter((l) => l.trim());
 
       const filesChanged = statLines
@@ -221,15 +317,15 @@ export class WorktreeService {
     }
 
     const patchPath = path.join(this.config.hiveDir, ".worktrees", feature, `${step}.patch`);
-    
+
     try {
       await fs.writeFile(patchPath, diffContent);
       const git = this.getGit();
       await git.applyPatch(patchPath);
-      await fs.unlink(patchPath).catch(() => {});
+      await fs.unlink(patchPath).catch(() => { });
       return { success: true, filesAffected: filesChanged };
     } catch (error: unknown) {
-      await fs.unlink(patchPath).catch(() => {});
+      await fs.unlink(patchPath).catch(() => { });
       const err = error as { message?: string };
       return {
         success: false,
@@ -252,10 +348,10 @@ export class WorktreeService {
       await fs.writeFile(patchPath, diffContent);
       const git = this.getGit();
       await git.applyPatch(patchPath, ["-R"]);
-      await fs.unlink(patchPath).catch(() => {});
+      await fs.unlink(patchPath).catch(() => { });
       return { success: true, filesAffected: filesChanged };
     } catch (error: unknown) {
-      await fs.unlink(patchPath).catch(() => {});
+      await fs.unlink(patchPath).catch(() => { });
       const err = error as { message?: string };
       return {
         success: false,
@@ -321,6 +417,73 @@ export class WorktreeService {
         /* intentional */
       }
     }
+  }
+
+  /**
+   * Remove worktrees from multiple repos for a single task.
+   * Handles partial cleanup gracefully - continues even if some repos fail.
+   * 
+   * @param feature - Feature name
+   * @param step - Step/task name
+   * @param repos - Array of repo paths that were used in createMultiRepo
+   * @param deleteBranch - Whether to delete the branches in each repo
+   */
+  async removeMultiRepo(
+    feature: string,
+    step: string,
+    repos: string[],
+    deleteBranch = false
+  ): Promise<{ removed: string[]; failed: string[] }> {
+    const worktreeBasePath = this.getWorktreePath(feature, step);
+    const branchName = this.getBranchName(feature, step);
+    const removed: string[] = [];
+    const failed: string[] = [];
+
+    for (const repoPath of repos) {
+      const repoName = path.basename(repoPath);
+      const repoFullPath = path.join(this.config.baseDir, repoPath);
+      const worktreePath = path.join(worktreeBasePath, repoName);
+
+      try {
+        const repoGit = simpleGit(repoFullPath);
+
+        try {
+          await repoGit.raw(["worktree", "remove", worktreePath, "--force"]);
+        } catch {
+          await fs.rm(worktreePath, { recursive: true, force: true });
+        }
+
+        try {
+          await repoGit.raw(["worktree", "prune"]);
+        } catch {
+          /* intentional */
+        }
+
+        if (deleteBranch) {
+          try {
+            await repoGit.deleteLocalBranch(branchName, true);
+          } catch {
+            /* intentional */
+          }
+        }
+
+        removed.push(repoName);
+      } catch {
+        failed.push(repoName);
+      }
+    }
+
+    // Clean up the task directory if empty
+    try {
+      const remaining = await fs.readdir(worktreeBasePath);
+      if (remaining.length === 0) {
+        await fs.rmdir(worktreeBasePath);
+      }
+    } catch {
+      /* intentional */
+    }
+
+    return { removed, failed };
   }
 
   async list(feature?: string): Promise<WorktreeInfo[]> {
@@ -405,10 +568,10 @@ export class WorktreeService {
       await fs.writeFile(patchPath, diffContent);
       const git = this.getGit();
       await git.applyPatch(patchPath, ["--check"]);
-      await fs.unlink(patchPath).catch(() => {});
+      await fs.unlink(patchPath).catch(() => { });
       return [];
     } catch (error: unknown) {
-      await fs.unlink(patchPath).catch(() => {});
+      await fs.unlink(patchPath).catch(() => { });
       const err = error as { message?: string };
       const stderr = err.message || "";
 
@@ -456,7 +619,7 @@ export class WorktreeService {
 
   async commitChanges(feature: string, step: string, message?: string): Promise<CommitResult> {
     const worktreePath = this.getWorktreePath(feature, step);
-    
+
     try {
       await fs.access(worktreePath);
     } catch {
@@ -467,10 +630,10 @@ export class WorktreeService {
 
     try {
       await worktreeGit.add("-A");
-      
+
       const status = await worktreeGit.status();
       const hasChanges = status.staged.length > 0 || status.modified.length > 0 || status.not_added.length > 0;
-      
+
       if (!hasChanges) {
         const currentSha = (await worktreeGit.revparse(["HEAD"])).trim();
         return { committed: false, sha: currentSha, message: "No changes to commit" };
@@ -478,17 +641,17 @@ export class WorktreeService {
 
       const commitMessage = message || `hive(${step}): task changes`;
       const result = await worktreeGit.commit(commitMessage, ["--allow-empty-message"]);
-      
-      return { 
-        committed: true, 
+
+      return {
+        committed: true,
         sha: result.commit,
         message: commitMessage,
       };
     } catch (error: unknown) {
       const err = error as { message?: string };
       const currentSha = (await worktreeGit.revparse(["HEAD"]).catch(() => "")).trim();
-      return { 
-        committed: false, 
+      return {
+        committed: false,
         sha: currentSha,
         message: err.message || "Commit failed",
       };
@@ -548,12 +711,12 @@ export class WorktreeService {
       }
     } catch (error: unknown) {
       const err = error as { message?: string };
-      
+
       if (err.message?.includes("CONFLICT") || err.message?.includes("conflict")) {
-        await git.raw(["merge", "--abort"]).catch(() => {});
-        await git.raw(["rebase", "--abort"]).catch(() => {});
-        await git.raw(["cherry-pick", "--abort"]).catch(() => {});
-        
+        await git.raw(["merge", "--abort"]).catch(() => { });
+        await git.raw(["rebase", "--abort"]).catch(() => { });
+        await git.raw(["cherry-pick", "--abort"]).catch(() => { });
+
         return {
           success: false,
           merged: false,
@@ -572,15 +735,15 @@ export class WorktreeService {
 
   async hasUncommittedChanges(feature: string, step: string): Promise<boolean> {
     const worktreePath = this.getWorktreePath(feature, step);
-    
+
     try {
       const worktreeGit = this.getGit(worktreePath);
       const status = await worktreeGit.status();
-      return status.modified.length > 0 || 
-             status.not_added.length > 0 || 
-             status.staged.length > 0 ||
-             status.deleted.length > 0 ||
-             status.created.length > 0;
+      return status.modified.length > 0 ||
+        status.not_added.length > 0 ||
+        status.staged.length > 0 ||
+        status.deleted.length > 0 ||
+        status.created.length > 0;
     } catch {
       return false;
     }

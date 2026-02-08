@@ -58,7 +58,7 @@ async function buildAutoLoadedSkillsContent(
   // Use process.env.HOME for testability, fallback to os.homedir()
   const homeDir = process.env.HOME || os.homedir();
   const skillTemplates: string[] = [];
-  
+
   for (const skillId of autoLoadSkills) {
     // 1. Try builtin skill first (builtin wins)
     const builtinSkill = BUILTIN_SKILLS.find((entry) => entry.name === skillId);
@@ -66,14 +66,14 @@ async function buildAutoLoadedSkillsContent(
       skillTemplates.push(builtinSkill.template);
       continue;
     }
-    
+
     // 2. Fallback to file-based skill
     const fileResult = await loadFileSkill(skillId, projectRoot, homeDir);
     if (fileResult.found && fileResult.skill) {
       skillTemplates.push(fileResult.skill.template);
       continue;
     }
-    
+
     // 3. Not found - warn and skip
     console.warn(`[hive] Unknown skill id "${skillId}" for agent "${agentName}"`);
   }
@@ -250,7 +250,7 @@ const plugin: Plugin = async (ctx) => {
   const disabledMcps = configService.getDisabledMcps();
   const disabledSkills = configService.getDisabledSkills();
   const builtinMcps = createBuiltinMcps(disabledMcps);
-  
+
   // Get filtered skills (globally disabled skills removed)
   // Per-agent skill filtering could be added here based on agent context
   const filteredSkills = getFilteredSkills(disabledSkills);
@@ -694,9 +694,18 @@ Expand your Discovery section and try again.`;
 
           // Check if we're continuing from blocked - reuse existing worktree
           let worktree: Awaited<ReturnType<typeof worktreeService.create>>;
+          let multiRepoWorktrees: Awaited<ReturnType<typeof worktreeService.createMultiRepo>> | null = null;
+
           if (continueFrom === 'blocked') {
             worktree = await worktreeService.get(feature, task);
             if (!worktree) return "Error: No worktree found for blocked task";
+          } else if (taskInfo.repos && taskInfo.repos.length > 0) {
+            // Multi-repo mode: create separate worktrees for each specified repo
+            multiRepoWorktrees = await worktreeService.createMultiRepo(feature, task, taskInfo.repos);
+            // Use first repo's worktree as the "primary" for compatibility
+            const firstRepoName = Object.keys(multiRepoWorktrees.repos)[0];
+            const firstWorktree = multiRepoWorktrees.repos[firstRepoName];
+            worktree = firstWorktree;
           } else {
             worktree = await worktreeService.create(feature, task);
           }
@@ -710,26 +719,26 @@ Expand your Discovery section and try again.`;
           // NOTE: Use services once and derive all needed formats from the result (no duplicate reads)
           const planResult = planService.read(feature);
           const allTasks = taskService.list(feature);
-          
+
           // Use contextService.list() instead of manual fs reads (Task 03 deduplication)
           // This replaces: fs.existsSync/readdirSync/readFileSync pattern
           const rawContextFiles = contextService.list(feature).map(f => ({
             name: f.name,
             content: f.content,
           }));
-          
+
           // Collect previous tasks ONCE and derive both formats from it
           const rawPreviousTasks = allTasks
             .filter(t => t.status === 'done' && t.summary)
             .map(t => ({ name: t.folder, summary: t.summary! }));
-          
+
           // Apply deterministic budgeting to bound prompt growth (Task 04)
           // - Limits to last N tasks with truncated summaries
           // - Truncates context files exceeding budget
           // - Emits truncation events for warnings
           const taskBudgetResult = applyTaskBudget(rawPreviousTasks, { ...DEFAULT_BUDGET, feature });
           const contextBudgetResult = applyContextBudget(rawContextFiles, { ...DEFAULT_BUDGET, feature });
-          
+
           // Use budgeted versions for prompt construction
           const contextFiles: ContextFile[] = contextBudgetResult.files.map(f => ({
             name: f.name,
@@ -739,13 +748,13 @@ Expand your Discovery section and try again.`;
             name: t.name,
             summary: t.summary,
           }));
-          
+
           // Collect all truncation events for warnings
           const truncationEvents: TruncationEvent[] = [
             ...taskBudgetResult.truncationEvents,
             ...contextBudgetResult.truncationEvents,
           ];
-          
+
           // Add hint about dropped tasks if any were omitted
           const droppedTasksHint = taskBudgetResult.droppedTasksHint;
 
@@ -825,7 +834,7 @@ Expand your Discovery section and try again.`;
           // This keeps the tool output small while preserving full prompt content
           const hiveDir = path.join(directory, '.hive');
           const workerPromptPath = writeWorkerPromptFile(feature, task, workerPrompt, hiveDir);
-          
+
           // Convert to relative path for portability in output
           const relativePromptPath = normalizePath(path.relative(directory, workerPromptPath));
 
@@ -874,6 +883,12 @@ Use the \`@path\` attachment syntax in the prompt to reference the file. Do not 
               prompt: taskToolPrompt,
             },
             instructions: taskToolInstructions,
+            // Multi-repo worktrees info (when task specifies repos)
+            ...(multiRepoWorktrees && {
+              multiRepoMode: true,
+              repos: taskInfo.repos,
+              worktrees: multiRepoWorktrees.repos,
+            }),
           };
 
           // Calculate payload meta (JSON size WITHOUT inlined prompt - file reference only)
@@ -886,7 +901,7 @@ Use the \`@path\` attachment syntax in the prompt to reference the file. Do not 
 
           // Check for warnings about threshold exceedance
           const sizeWarnings = checkWarnings(promptMeta, payloadMeta);
-          
+
           // Convert truncation events to warnings format for unified output
           const budgetWarnings = truncationEvents.map(event => ({
             type: event.type as string,
@@ -895,7 +910,7 @@ Use the \`@path\` attachment syntax in the prompt to reference the file. Do not 
             affected: event.affected,
             count: event.count,
           }));
-          
+
           // Combine all warnings
           const allWarnings = [...sizeWarnings, ...budgetWarnings];
 
@@ -1392,9 +1407,9 @@ Re-run with updated summary showing verification results.`;
       // Build agents map based on agentMode
       const hiveConfigData = configService.get();
       const agentMode = hiveConfigData.agentMode ?? 'unified';
-      
+
       const allAgents: Record<string, unknown> = {};
-      
+
       if (agentMode === 'unified') {
         allAgents['hive-master'] = hiveConfig;
         allAgents['scout-researcher'] = scoutConfig;
@@ -1432,7 +1447,7 @@ Re-run with updated summary showing verification results.`;
       }
 
       // Set default agent based on mode
-      (opencodeConfig as Record<string, unknown>).default_agent = 
+      (opencodeConfig as Record<string, unknown>).default_agent =
         agentMode === 'unified' ? 'hive-master' : 'architect-planner';
 
       // Merge built-in MCP servers (OMO-style remote endpoints)

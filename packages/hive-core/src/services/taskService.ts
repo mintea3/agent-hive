@@ -47,26 +47,28 @@ interface ParsedTask {
   description: string;
   /** Raw dependency numbers parsed from plan. null = not specified (use implicit), [] = explicit none */
   dependsOnNumbers: number[] | null;
+  /** Repository paths for multi-repo worktrees. null = not specified (use whole repo) */
+  repos: string[] | null;
 }
 
 export class TaskService {
-  constructor(private projectRoot: string) {}
+  constructor(private projectRoot: string) { }
 
   sync(featureName: string): TasksSyncResult {
     const planPath = getPlanPath(this.projectRoot, featureName);
     const planContent = readText(planPath);
-    
+
     if (!planContent) {
       throw new Error(`No plan.md found for feature '${featureName}'`);
     }
 
     const planTasks = this.parseTasksFromPlan(planContent);
-    
+
     // Validate dependency graph before proceeding
     this.validateDependencyGraph(planTasks, featureName);
-    
+
     const existingTasks = this.list(featureName);
-    
+
     const result: TasksSyncResult = {
       created: [],
       removed: [],
@@ -120,7 +122,7 @@ export class TaskService {
   create(featureName: string, name: string, order?: number): string {
     const tasksPath = getTasksPath(this.projectRoot, featureName);
     const existingFolders = this.listFolders(featureName);
-    
+
     // Auto-increment: finds max existing index + 1
     const nextOrder = order ?? this.getNextOrder(existingFolders);
     // Zero-pad to 2 digits for correct alphabetical sorting (01, 02, ... 99)
@@ -151,6 +153,7 @@ export class TaskService {
       origin: 'plan',
       planTitle: task.name,
       dependsOn,
+      repos: task.repos ?? undefined,
     };
     writeJson(getTaskStatusPath(this.projectRoot, featureName, task.folder), status);
 
@@ -310,14 +313,14 @@ export class TaskService {
    */
   private validateDependencyGraph(tasks: ParsedTask[], featureName: string): void {
     const taskNumbers = new Set(tasks.map(t => t.order));
-    
+
     // Validate each task's dependencies
     for (const task of tasks) {
       if (task.dependsOnNumbers === null) {
         // Implicit dependencies - no validation needed
         continue;
       }
-      
+
       for (const depNum of task.dependsOnNumbers) {
         // Check for self-dependency
         if (depNum === task.order) {
@@ -326,7 +329,7 @@ export class TaskService {
             `A task cannot depend on itself. Please fix the "Depends on:" line in plan.md.`
           );
         }
-        
+
         // Check for unknown task number
         if (!taskNumbers.has(depNum)) {
           throw new Error(
@@ -337,7 +340,7 @@ export class TaskService {
         }
       }
     }
-    
+
     // Check for cycles using DFS
     this.detectCycles(tasks);
   }
@@ -349,7 +352,7 @@ export class TaskService {
   private detectCycles(tasks: ParsedTask[]): void {
     // Build adjacency list: task order -> [dependency orders]
     const taskByOrder = new Map(tasks.map(t => [t.order, t]));
-    
+
     // Build dependency graph with resolved implicit dependencies
     const getDependencies = (task: ParsedTask): number[] => {
       if (task.dependsOnNumbers !== null) {
@@ -361,35 +364,35 @@ export class TaskService {
       }
       return [task.order - 1];
     };
-    
+
     // Track visited state: 0 = unvisited, 1 = in current path, 2 = fully processed
     const visited = new Map<number, number>();
     const path: number[] = [];
-    
+
     const dfs = (taskOrder: number): void => {
       const state = visited.get(taskOrder);
-      
+
       if (state === 2) {
         // Already fully processed, no cycle through here
         return;
       }
-      
+
       if (state === 1) {
         // Found a cycle! Build the cycle path for the error message
         const cycleStart = path.indexOf(taskOrder);
         const cyclePath = [...path.slice(cycleStart), taskOrder];
         const cycleDesc = cyclePath.join(' -> ');
-        
+
         throw new Error(
           `Invalid dependency graph in plan.md: Cycle detected in task dependencies: ${cycleDesc}. ` +
           `Tasks cannot have circular dependencies. Please fix the "Depends on:" lines in plan.md.`
         );
       }
-      
+
       // Mark as in current path
       visited.set(taskOrder, 1);
       path.push(taskOrder);
-      
+
       const task = taskByOrder.get(taskOrder);
       if (task) {
         const deps = getDependencies(task);
@@ -397,12 +400,12 @@ export class TaskService {
           dfs(depOrder);
         }
       }
-      
+
       // Mark as fully processed
       path.pop();
       visited.set(taskOrder, 2);
     };
-    
+
     // Run DFS from each node
     for (const task of tasks) {
       if (!visited.has(task.order)) {
@@ -435,7 +438,7 @@ export class TaskService {
   ): TaskStatus {
     const statusPath = getTaskStatusPath(this.projectRoot, featureName, taskFolder);
     const current = readJson<TaskStatus>(statusPath);
-    
+
     if (!current) {
       throw new Error(`Task '${taskFolder}' not found`);
     }
@@ -479,20 +482,20 @@ export class TaskService {
     lockOptions?: LockOptions
   ): TaskStatus {
     const statusPath = getTaskStatusPath(this.projectRoot, featureName, taskFolder);
-    
+
     // Build the patch object, only including fields that are defined
     const safePatch: Partial<TaskStatus> = {
       schemaVersion: TASK_STATUS_SCHEMA_VERSION,
     };
-    
+
     if (patch.idempotencyKey !== undefined) {
       safePatch.idempotencyKey = patch.idempotencyKey;
     }
-    
+
     if (patch.workerSession !== undefined) {
       safePatch.workerSession = patch.workerSession as WorkerSession;
     }
-    
+
     // Use patchJsonLockedSync which does deep merge
     return patchJsonLockedSync<TaskStatus>(statusPath, safePatch, lockOptions);
   }
@@ -508,7 +511,7 @@ export class TaskService {
   get(featureName: string, taskFolder: string): TaskInfo | null {
     const statusPath = getTaskStatusPath(this.projectRoot, featureName, taskFolder);
     const status = readJson<TaskStatus>(statusPath);
-    
+
     if (!status) return null;
 
     return {
@@ -518,6 +521,7 @@ export class TaskService {
       origin: status.origin,
       planTitle: status.planTitle,
       summary: status.summary,
+      repos: status.repos,
     };
   }
 
@@ -553,47 +557,51 @@ export class TaskService {
 
   private getNextOrder(existingFolders: string[]): number {
     if (existingFolders.length === 0) return 1;
-    
+
     const orders = existingFolders
       .map(f => parseInt(f.split('-')[0], 10))
       .filter(n => !isNaN(n));
-    
+
     return Math.max(...orders, 0) + 1;
   }
 
   private parseTasksFromPlan(content: string): ParsedTask[] {
     const tasks: ParsedTask[] = [];
     const lines = content.split('\n');
-    
+
     let currentTask: ParsedTask | null = null;
     let descriptionLines: string[] = [];
-    
-    // Regex to match "Depends on:" or "**Depends on**:" with optional markdown
-    // Strips markdown formatting (**, *, etc.) and captures the value
-    const dependsOnRegex = /^\s*\*{0,2}Depends\s+on\*{0,2}\s*:\s*(.+)$/i;
-    
+
+    // Regex to match "Depends on:" or "**Depends on**:" with optional markdown and bullet
+    // Supports: "Depends on:", "**Depends on**:", "- **Depends on**:", "- Depends on:"
+    const dependsOnRegex = /^\s*-?\s*\*{0,2}Depends\s+on\*{0,2}\s*:\s*(.+)$/i;
+    // Regex to match "Repos:" or "**Repos**:" with optional markdown and bullet
+    // Supports: "Repos:", "**Repos**:", "- **Repos**:", "- Repos:"
+    const reposRegex = /^\s*-?\s*\*{0,2}Repos\*{0,2}\s*:\s*(.+)$/i;
+
     for (const line of lines) {
       // Check for task header: ### N. Task Name
       const taskMatch = line.match(/^###\s+(\d+)\.\s+(.+)$/);
-      
+
       if (taskMatch) {
         // Save previous task if exists
         if (currentTask) {
           currentTask.description = descriptionLines.join('\n').trim();
           tasks.push(currentTask);
         }
-        
+
         const order = parseInt(taskMatch[1], 10);
         const rawName = taskMatch[2].trim();
         const folderName = rawName.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
         const folder = `${String(order).padStart(2, '0')}-${folderName}`;
-        
+
         currentTask = {
           folder,
           order,
           name: rawName,
           description: '',
           dependsOnNumbers: null,  // null = not specified, use implicit
+          repos: null,  // null = not specified, use whole repo
         };
         descriptionLines = [];
       } else if (currentTask) {
@@ -619,11 +627,25 @@ export class TaskService {
               currentTask.dependsOnNumbers = numbers;
             }
           }
+          // Check for Repos: annotation within task section
+          const reposMatch = line.match(reposRegex);
+          if (reposMatch) {
+            const value = reposMatch[1].trim();
+            if (value.toLowerCase() === 'none' || value === '') {
+              currentTask.repos = null;  // Explicit none = use whole repo
+            } else {
+              // Parse comma-separated repo paths (e.g., "libs/sdk, services/bifrost")
+              currentTask.repos = value
+                .split(/,/)
+                .map(s => s.trim())
+                .filter(s => s.length > 0);
+            }
+          }
           descriptionLines.push(line);
         }
       }
     }
-    
+
     // Don't forget the last task
     if (currentTask) {
       currentTask.description = descriptionLines.join('\n').trim();
